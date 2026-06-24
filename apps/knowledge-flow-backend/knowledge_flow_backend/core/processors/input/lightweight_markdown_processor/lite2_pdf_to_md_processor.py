@@ -218,12 +218,13 @@ class LitePdfMarkdownProcessor(BaseMarkdownProcessor):
         try:
             doc = fitz.open(str(file_path))
             info = doc.metadata or {}
+            page_count = doc.page_count  # read before close
             doc.close()
             return {
                 "title": info.get("title") or None,
                 "author": info.get("author") or None,
                 "document_name": file_path.name,
-                "page_count": doc.page_count,
+                "page_count": page_count,
                 "extras": {
                     "pdf.subject": info.get("subject") or None,
                     "pdf.producer": info.get("producer") or None,

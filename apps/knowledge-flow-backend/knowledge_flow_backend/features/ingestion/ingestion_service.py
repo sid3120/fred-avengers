@@ -19,12 +19,13 @@ import threading
 from typing import Iterable, Optional, Tuple
 
 from fred_core import Action, KeycloakUser, Resource, authorize
-from fred_core.documents.document_structures import DocumentMetadata, ProcessingStage, SourceType
 
 from knowledge_flow_backend.application_context import ApplicationContext
+from knowledge_flow_backend.common.document_structures import DocumentMetadata, ProcessingStage, SourceType
 from knowledge_flow_backend.common.processing_profile_context import coerce_processing_profile, processing_profile_scope
 from knowledge_flow_backend.common.structures import IngestionProcessingProfile
 from knowledge_flow_backend.core.processing_pipeline_manager import ProcessingPipelineManager
+from knowledge_flow_backend.core.processors.input.common.pdf_pre_flight_classifier import PdfDocumentType, PdfPreFlightClassifier
 from knowledge_flow_backend.features.metadata.service import MetadataNotFound, MetadataService
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,14 @@ class IngestionService:
         Saves metadata.json alongside.
         """
         normalized_profile = coerce_processing_profile(profile)
+        if input_path.suffix.lower() == ".pdf" and normalized_profile == IngestionProcessingProfile.fast:
+            doc_type = PdfPreFlightClassifier.classify(input_path)
+            if doc_type == PdfDocumentType.SCANNED:
+                logger.info(
+                    "Pre-flight: scanned PDF detected (%s) — upgrading profile fast → medium",
+                    input_path.name,
+                )
+                normalized_profile = IngestionProcessingProfile.medium
         with processing_profile_scope(normalized_profile):
             pipeline = self.pipeline_manager.get_pipeline_for_metadata(metadata, profile=normalized_profile)
             pipeline.process_input(input_path=input_path, output_dir=output_dir, metadata=metadata)

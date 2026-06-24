@@ -1236,7 +1236,6 @@ Execution: GitHub issue `#1664`
 #### OPS-04 Unified task event stream and migration cockpit
 
 RFC ref: `docs/swift/rfc/TASK-EVENT-STREAM-RFC.md`
-Execution: waived GitHub issue for local session
 
 **P1 — Shared infrastructure (fred-core + both backends)**
 
@@ -1264,14 +1263,6 @@ Execution: waived GitHub issue for local session
 - [ ] `record_workflow_status` and `record_current_document` activities emit `TaskEvent` via `IEventBus`
 - [ ] Ingestion UI panels consume `useTaskStream` — live per-document progress replaces polling
 - [ ] Deprecate `sched_workflow_tasks` table (superseded by `task_run`)
-
-**Task reconciliation — durable execution binding + sweeper (RFC §2.8)**
-
-- [ ] Add `executor` + `execution_id` columns to `task_run` (typed, no JSONB); submitter binds them before `scheduler.submit` using a pre-generated workflow id (no clobber race)
-- [ ] Extend `IScheduler` with `get_status(execution_id) -> ExecutionStatus | None` (`TemporalScheduler` via `describe`; `None` = unreachable)
-- [ ] `TaskService.reconcile_task` / `reconcile_stale`: map executor status → terminal `failed` `TaskEvent`; `running` / `None` leave untouched (never false-fail)
-- [ ] Sweeper: Temporal scheduled workflow per task-owning worker calls `reconcile_stale(grace, limit)`; optional read-time reconcile on SSE subscribe
-- [ ] Tests: reconcile decision matrix (failed / timed_out / completed / running / None) + integration (stuck task → terminal without the original worker)
 
 #### OPS-05 Object storage naming cleanup
 
@@ -2418,26 +2409,17 @@ _Depends on: PROMPT-03 (OpenAPI regenerated)_
 
 ---
 
-**Slice PROMPT-05 — multi-prompt chat context picker (PROMPT-05) · Done 2026-06-19 — Dimitri**
+**Slice PROMPT-05 — chat context picker (PROMPT-05)**
 
-_Depends on: PROMPT-03 · Execution: branch `1779-fully-wire-prompts-in-the-chat-ui-page` · Contract: [PROMPT-LIBRARY-RFC.md](../rfc/PROMPT-LIBRARY-RFC.md) §4 (Part 3, multi-prompt) + CONTROL-PLANE-PRODUCT-CONTRACT §13_
+_Depends on: PROMPT-03_
 
-Backend (multi-prompt — supersedes the single `context_prompt_id` design):
-
-- [x] Ordered association table `session_context_prompts` (Alembic `e7f8a9b0c1d2`; backfills scalar → `position=0`, drops `session_metadata.context_prompt_id`)
-- [x] `UpdateSessionRequest` / `SessionListItem`: `context_prompt_id` → `context_prompt_ids: list[str]` (full ordered replacement; `[]`/present-null clears; absent leaves unchanged via `model_fields_set`)
-- [x] `prepare_execution` resolves attached ids in order (library + `default:{cat}`), skips stale, concatenates `\n\n` into existing scalar `context_prompt_text` (fred-sdk/fred-runtime untouched)
-- [x] `session_count` increments on **first attach** only; `GET /prompts/context` gains `category`
-- [x] Store + endpoint unit tests; `make test` (167) + `make code-quality` green
-
-Frontend:
-
-- [x] `Prompts` row in `SearchConfig` (always shown) → multi-select `ContextPromptPicker` (personal/team/default groups, category icon, score stars, usage count)
-- [x] Source: `GET /teams/{team_id}/prompts/context` (union personal + team + defaults)
-- [x] Active prompts as removable `ContextPromptChips` in composer `aboveTextSlot`; selection → `PATCH /sessions/{id} { context_prompt_ids }`; empty list clears
-- [x] Rehydrate pills from `SessionListItem.context_prompt_ids` on session open; `useChatSse` passes `session_id` to `prepare-execution`
-- [x] Unit tests for `ContextPromptPicker` (groups/selection/stars/empty + pure `nextContextPromptSelection`) and `ContextPromptChips`
-- [x] `tsc --noEmit` + Prettier pass; 253 vitest tests green
+- [ ] Replace free textarea in session init surface / `ComposerSettingsControls` topSlot with a library picker (`AgentOptionsPanel` retired 2026-05-24 — see PROMPT-LIBRARY-RFC §PROMPT-05)
+- [ ] Source: `GET /teams/{team_id}/prompts/context` (union personal + team)
+- [ ] Display: personal group + team group, ordered by `session_count DESC`, score stars when non-null
+- [ ] Selection → `PATCH /sessions/{id} { context_prompt_id }` → increments `session_count`
+- [ ] "Clear context" → `PATCH /sessions/{id} { context_prompt_id: null }`
+- [ ] "Edit in personal library" shortcut → navigates to `PromptsPage` scoped to personal team
+- [ ] `tsc --noEmit` + Prettier pass
 
 ---
 
@@ -3656,21 +3638,48 @@ while preserving behavior and keeping default tests offline.
 
 ---
 
-## Phase AGENTS — pod showcase agents
+### QUALITY-04 Adaptive PDF extraction — pre-flight classifier
 
-### AGENTS — Document comparison agent — **FILES-03**
+**Status:** in progress
+**Owner:** Dimitri
+**Scope:** `apps/knowledge-flow-backend` — ingestion pipeline, PDF processors, ingestion service
+**Issue:** https://github.com/ThalesGroup/fred/issues/1191
 
-RFC: [`SIMILARITY-COMPARISON-AGENT-RFC.md`](../rfc/SIMILARITY-COMPARISON-AGENT-RFC.md).
-First public-pod consumer of the targeted `similarity_search` primitive
-([KF-SIMILARITY-SEARCH](../rfc/KNOWLEDGE-FLOW-SIMILARITY-SEARCH-RFC.md)).
+**Why this exists:**
 
-- [x] New `fred.dt.comparison.graph` GraphAgent in `apps/fred-agents` comparing two
-      picked documents → concordances / contradictions / lacunae, deterministic
-      pairing with the LLM only judging. Declares the Text MCP server; calls
-      `similarity_search` via `invoke_runtime_tool`. No new MCP service / `TOOL_REF`.
-      Execution: branch `1772-…-kf-similarity-search`.
-- [x] Registered in `fred_agents/registry.py`; offline tests (graph wiring + pair
-      judging with mocked tool + seeded model). `make code-quality` + `make test` green.
+- The `fast` profile uses `LitePdfMarkdownProcessor` (pymupdf4llm with `ignore_images=True`).
+  For scanned/image-only PDFs, this silently returns near-zero text with no warning or escalation.
+- The system has no mechanism to detect the PDF content type before choosing an extraction strategy.
+- This causes silent quality failures: users ingesting scanned contracts or reports via `fast`
+  receive empty or near-empty knowledge chunks downstream.
+
+**Execution slices:**
+
+- [x] **Q4.1 Bug fixes & config migration**
+      - [x] Fix use-after-close bug in `lite2_pdf_to_md_processor.extract_file_metadata` (`doc.close()` before `doc.page_count` read)
+      - [x] Migrate `fast` profile config from v1 (`lite_pdf_to_md_processor`) to v2 (`lite2_pdf_to_md_processor`)
+
+- [x] **Q4.2 PdfPreFlightClassifier module**
+      - [x] New `pdf_pre_flight_classifier.py` in `core/processors/input/common/`
+      - [x] `PdfDocumentType` enum: `NATIVE_TEXT`, `SCANNED`
+      - [x] Heuristic: sample first 3 pages via fitz, check text char count + image presence
+      - [x] Fail-safe: any exception → `NATIVE_TEXT`
+      - [x] Unit tests: 6 cases (digital, scanned, mixed, exception, empty PDF, image-free blank)
+
+- [x] **Q4.3 Wire classifier into IngestionService**
+      - [x] `ingestion_service.process_input()`: if `.pdf` + `fast` + classifier returns `SCANNED` → upgrade to `medium`, log override
+      - [x] Tests: 4 cases (scanned upgrades, native stays, medium unchanged, non-PDF bypassed)
+
+- [ ] **Q4.4 Test coverage for v2 processor**
+      - [x] New `test_lite2_pdf_to_md_processor.py` with 11 unit tests (written in Phase 1)
+      - [ ] Verify coverage ≥ 70% once `make test` runs with network access
+
+**Definition of done:**
+
+- [ ] `make code-quality && make test` green in `apps/knowledge-flow-backend`
+- [ ] Scanned PDF ingested via `fast` profile routes to `medium` pipeline with log confirmation
+- [ ] Digital-native PDFs: zero behavior change
+- [ ] No new external dependencies introduced
 
 ---
 
@@ -3719,25 +3728,6 @@ Execution: branch `1795-…-native-google-cloud-storage-backend`; GitHub issue #
 - [x] Prometheus labels contain no unbounded-cardinality dims (session_id, user_id removed)
 - [ ] frontend runtime reachability comes from `ExecutionPreparation`, not bootstrap-side routing inference
 - [ ] `agentic-backend` is no longer on the critical frontend path
-
----
-
-## §INGEST — Extensible Document Processor Architecture
-
-**ID:** INGEST-01 | **Owner:** Timothé | **Status:** not started — RFC complete, awaiting developer confirmation
-**RFC:** `docs/swift/rfc/EXTENSIBLE-DOCUMENT-PROCESSOR-RFC.md`
-
-- [ ] INGEST-01 — Developer confirmation before implementation begins
-- [ ] INGEST-01 — Register `BaseProcessor` unified lifecycle contract (`extract_metadata`, `extract_content`, `vectorize`, `delete`)
-- [ ] INGEST-01 — Implement block registry and startup validation (`OcrBlock`, `ImageDescriberBlock`, `MarkdownNormalizerBlock`)
-- [ ] INGEST-01 — Implement trigger resolution engine (suffix, filename_pattern, custom predicate, specificity ordering)
-- [ ] INGEST-01 — Dynamic processor registration loop in `main_worker.py`
-- [ ] INGEST-01 — Migrate `worker_policy` timeout/retry to global config; remove per-profile timeout config
-- [ ] INGEST-01 — Implement `TransientProcessingError` / `StructuralProcessingError` / `ResourceProcessingError` classification
-- [ ] INGEST-01 — Implement `@timed_task` decorator and RAM observability hooks
-- [ ] INGEST-01 — Ship `BaseProcessorTest` harness with `NullOcrBlock`, `FixtureImageDescriberBlock`, `StubVectorStore`
-- [ ] INGEST-01 — Remove `mode` field from ingestion API and configuration
-- [ ] INGEST-01 — Deprecate `processing.profiles` in `configuration.schema.json`
 
 ---
 
